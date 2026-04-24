@@ -3,23 +3,21 @@ import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 import plotly.express as px
-from plotly.subplots import make_subplots
 
 st.set_page_config(page_title="Cost Database Explorer", layout="wide")
 st.title("Cost Database Explorer")
 
-# ── Sidebar: file upload ───────────────────────────────────────────────────────
+# ── File upload ────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.header("Data Source")
     uploaded_file = st.file_uploader("Upload Excel file (.xlsx)", type=["xlsx", "xls"])
-    st.markdown("---")
     st.caption("If no file is uploaded the bundled example database is used.")
 
 
 @st.cache_data
 def load_data(source):
     xl = pd.ExcelFile(source)
-    df_gen = pd.read_excel(xl, sheet_name="General")
+    df_gen  = pd.read_excel(xl, sheet_name="General")
     df_cost = pd.read_excel(xl, sheet_name="Cost")
     return df_gen, df_cost
 
@@ -31,226 +29,233 @@ except Exception as e:
     st.error(f"Could not load data: {e}")
     st.stop()
 
-# ── Normalise Cost sheet to USD/MWp ───────────────────────────────────────────
+# ── Sidebar: FX rates for non-USD currencies ──────────────────────────────────
+_curr_col = next((c for c in df_gen.columns if c.strip().lower() == "native currency"), None)
+_fx_col   = next((c for c in df_gen.columns if c.strip().lower() == "fx to usd"), None)
 
-def compute_usd_per_mwp(row):
-    """Return USD/MWp regardless of original unit basis."""
-    unit = row["Unit Basis"]
-    usd = row["USD Value"]
-    dc_mwp = row["Project DC MWp"]
-    if pd.isna(usd):
-        return np.nan
-    if unit == "m$":
-        if pd.isna(dc_mwp) or dc_mwp == 0:
-            return np.nan
-        return (usd * 1_000_000) / dc_mwp
-    if unit == "$/kWp":
-        return usd * 1_000          # $/kWp → $/MWp
-    # $/year and anything else: not comparable on a per-MWp basis
-    return np.nan
+fx_rates = {"USD": 1.0}   # currency → rate applied to convert native → USD
 
+if _curr_col:
+    non_usd = [c for c in df_gen[_curr_col].dropna().unique() if str(c).strip().upper() != "USD"]
+    if non_usd:
+        with st.sidebar:
+            st.markdown("---")
+            st.subheader("Currency conversion to USD")
+            for curr in sorted(non_usd):
+                curr_str = str(curr).strip().upper()
+                # Suggest rate from FX to USD column if present, else 1.0
+                if _fx_col:
+                    mask = df_gen[_curr_col].astype(str).str.strip().str.upper() == curr_str
+                    suggested = df_gen.loc[mask, _fx_col].apply(pd.to_numeric, errors="coerce").mean()
+                    default = float(suggested) if pd.notna(suggested) else 1.0
+                else:
+                    default = 1.0
+                fx_rates[curr_str] = st.number_input(
+                    f"{curr_str} → USD",
+                    min_value=0.0001,
+                    value=round(default, 6),
+                    format="%.6f",
+                    key=f"fx_{curr_str}",
+                )
 
-def compute_usd_per_year(row):
-    """Return annualised USD value (for $/year rows)."""
-    if row["Unit Basis"] == "$/year":
-        return row["USD Value"]
-    return np.nan
-
-
-df_cost = df_cost.copy()
-df_cost["USD_per_MWp"] = df_cost.apply(compute_usd_per_mwp, axis=1)
-df_cost["USD_per_year"] = df_cost.apply(compute_usd_per_year, axis=1)
+def get_fx(currency):
+    """Return the USD conversion rate for a currency string."""
+    if pd.isna(currency):
+        return 1.0
+    return fx_rates.get(str(currency).strip().upper(), 1.0)
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
-
 def numeric_cols(df):
     return df.select_dtypes(include="number").columns.tolist()
 
-
-def all_cols(df):
-    return df.columns.tolist()
-
-
-CHART_TYPES = ["Bar", "Scatter", "Line"]
 COLOUR_SEQ = px.colors.qualitative.Plotly
 
 # ══════════════════════════════════════════════════════════════════════════════
-# CHART 1 — General sheet
+# CHART 1 — Bubble chart
 # ══════════════════════════════════════════════════════════════════════════════
-st.header("Chart 1 — General Overview")
+st.header("Projects Overview")
 
-gen_all = all_cols(df_gen)
+gen_all = df_gen.columns.tolist()
 gen_num = numeric_cols(df_gen)
 
-c1, c2, c3, c4 = st.columns([2, 2, 2, 2])
+c1, c2, c3 = st.columns(3)
 with c1:
-    x_col = st.selectbox("X-axis", options=gen_all, index=gen_all.index("Project ID") if "Project ID" in gen_all else 0)
+    x_col = st.selectbox("X-axis (grouping)", options=gen_all,
+                         index=gen_all.index("Region") if "Region" in gen_all else 0)
 with c2:
-    y1_default = gen_num[0] if gen_num else None
-    y1_col = st.selectbox("Y-axis 1", options=gen_num, index=0)
+    y1_col = st.selectbox("Y-axis", options=gen_num, index=0)
 with c3:
-    y2_options = ["— none —"] + [c for c in gen_num if c != y1_col]
-    y2_col = st.selectbox("Y-axis 2 (optional)", options=y2_options, index=0)
-    y2_col = None if y2_col == "— none —" else y2_col
-with c4:
-    chart1_type = st.selectbox("Chart type", options=CHART_TYPES, index=0, key="ct1")
+    size_options = ["— none —"] + [c for c in gen_num if c != y1_col]
+    size_col = st.selectbox("Bubble size & colour", options=size_options, index=0)
+    size_col = None if size_col == "— none —" else size_col
 
-# Tag filter — values of the selected X-axis column
 x_unique = sorted(df_gen[x_col].dropna().astype(str).unique().tolist())
-tag_filter = st.multiselect(
-    f"Filter by {x_col}",
-    options=x_unique,
-    default=x_unique,
-    key="tag1",
-)
+tag_filter = st.multiselect(f"Filter by {x_col}", options=x_unique, default=x_unique)
 
-df_gen_f = df_gen[df_gen[x_col].astype(str).isin(tag_filter)].copy() if tag_filter else df_gen.copy()
+df_f = (df_gen[df_gen[x_col].astype(str).isin(tag_filter)] if tag_filter else df_gen) \
+       .reset_index(drop=True).copy()
 
-# Build chart 1
-fig1 = make_subplots(specs=[[{"secondary_y": bool(y2_col)}]])
+# Completeness: share of non-NaN columns per row
+df_f["_completeness"] = (df_f.notna().sum(axis=1) / len(df_f.columns) * 100).round(0).astype(int)
 
-x_vals = df_gen_f[x_col].astype(str)
+hover_col = next((c for c in ["Project Name", "Project ID"] if c in df_f.columns), None)
 
-def add_trace(fig, x, y, name, ctype, secondary=False, color=None):
-    kw = dict(name=name, marker_color=color) if color else dict(name=name)
-    if ctype == "Bar":
-        fig.add_trace(go.Bar(x=x, y=y, **kw), secondary_y=secondary)
-    elif ctype == "Scatter":
-        kw.pop("marker_color", None)
-        fig.add_trace(go.Scatter(x=x, y=y, mode="markers", name=name,
-                                 marker=dict(color=color, size=9)), secondary_y=secondary)
-    else:  # Line
-        kw.pop("marker_color", None)
-        fig.add_trace(go.Scatter(x=x, y=y, mode="lines+markers", name=name,
-                                 line=dict(color=color)), secondary_y=secondary)
+# X positions with jitter for categorical axes
+_x_is_num = pd.api.types.is_numeric_dtype(df_gen[x_col])
+if _x_is_num:
+    df_f["_x_pos"] = pd.to_numeric(df_f[x_col], errors="coerce")
+    _cat_map = {}
+else:
+    _cats = df_f[x_col].astype(str).unique().tolist()
+    _cat_map = {c: i for i, c in enumerate(_cats)}
+    rng = np.random.default_rng(42)
+    df_f["_x_pos"] = df_f[x_col].astype(str).map(_cat_map) + rng.uniform(-0.3, 0.3, len(df_f))
 
-add_trace(fig1, x_vals, df_gen_f[y1_col], y1_col, chart1_type, secondary=False,
-          color=COLOUR_SEQ[0])
-if y2_col:
-    add_trace(fig1, x_vals, df_gen_f[y2_col], y2_col,
-              "Line" if chart1_type == "Bar" else chart1_type,
-              secondary=True, color=COLOUR_SEQ[1])
+# 3-bucket sizes relative to filtered range
+_metric_col = size_col if size_col else y1_col
+_metric = pd.to_numeric(df_f[_metric_col], errors="coerce").abs()
+_lo, _hi = _metric.min(), _metric.max()
+if pd.notna(_hi) and _hi > _lo:
+    _pct = (_metric - _lo) / (_hi - _lo) * 100
+    df_f["_size"] = _pct.apply(lambda p: 16 if p <= 30 else (28 if p <= 60 else 44))
+    df_f["_size"] = df_f["_size"].where(_metric.notna(), 16)
+else:
+    df_f["_size"] = 28
 
-fig1.update_layout(
-    height=460,
-    barmode="group",
-    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-    xaxis_title=x_col,
-)
-fig1.update_yaxes(title_text=y1_col, secondary_y=False)
-if y2_col:
-    fig1.update_yaxes(title_text=y2_col, secondary_y=True)
+_color_vals = _metric.fillna(_lo if pd.notna(_lo) else 0)
 
+# Hover text
+def _fmt(s):
+    return pd.to_numeric(s, errors="coerce").round(2).astype(str)
+
+hover_parts = []
+if hover_col:
+    hover_parts.append(df_f[hover_col].astype(str))
+hover_parts.append("<b>" + x_col + ":</b> " + df_f[x_col].astype(str))
+hover_parts.append("<b>" + y1_col + ":</b> " + _fmt(df_f[y1_col]))
+if size_col:
+    hover_parts.append("<b>" + size_col + ":</b> " + _fmt(df_f[size_col]))
+hover_parts.append("<b>Completeness:</b> " + df_f["_completeness"].astype(str) + "%")
+hover_text = ["<br>".join(row) for row in zip(*hover_parts)]
+
+bubble_label = df_f.apply(
+    lambda r: f"{r['_completeness']}%" if r["_size"] >= 28 else "", axis=1
+).tolist()
+
+fig1 = go.Figure(go.Scatter(
+    x=df_f["_x_pos"].tolist(),
+    y=pd.to_numeric(df_f[y1_col], errors="coerce").tolist(),
+    mode="markers+text",
+    text=bubble_label,
+    textposition="middle center",
+    textfont=dict(size=8, color="white", family="Arial Black"),
+    hovertext=hover_text,
+    hovertemplate="%{hovertext}<extra></extra>",
+    marker=dict(
+        size=df_f["_size"].tolist(),
+        sizemode="diameter",
+        color=_color_vals.tolist(),
+        colorscale="RdYlBu_r",
+        showscale=True,
+        colorbar=dict(title=dict(text=_metric_col, side="right"), thickness=14, len=0.8),
+        cmin=float(_lo) if pd.notna(_lo) else None,
+        cmax=float(_hi) if pd.notna(_hi) else None,
+        opacity=0.85,
+        line=dict(width=0.6, color="white"),
+    ),
+))
+
+if not _x_is_num and _cat_map:
+    fig1.update_xaxes(tickvals=list(_cat_map.values()),
+                      ticktext=list(_cat_map.keys()), tickangle=-30)
+
+fig1.update_layout(height=540, xaxis_title=x_col, yaxis_title=y1_col,
+                   hovermode="closest", margin=dict(r=120, b=80))
 st.plotly_chart(fig1, use_container_width=True)
 
-# Data table toggle
-with st.expander("Show filtered General data"):
-    st.dataframe(df_gen_f.reset_index(drop=True), use_container_width=True)
+with st.expander("Show filtered data"):
+    st.dataframe(
+        df_f.drop(columns=["_x_pos", "_size", "_completeness"], errors="ignore")
+            .reset_index(drop=True),
+        use_container_width=True,
+    )
+
+# Shared scope across Chart 2 and 3
+label_col = "Project Name" if "Project Name" in df_f.columns else "Project ID"
 
 # ══════════════════════════════════════════════════════════════════════════════
-# CHART 2 — Cost breakdown for the projects visible in Chart 1
+# CHART 2 — CAPEX by project (General sheet, FX-converted to USD)
 # ══════════════════════════════════════════════════════════════════════════════
-st.header("Chart 2 — Cost Breakdown by Component")
-st.caption("Scope: projects currently shown in Chart 1 (after tag filter).")
+st.header("CAPEX by Project")
 
-# Derive project IDs from the filtered General view
-active_pids = df_gen_f["Project ID"].dropna().unique().tolist()
-df_cost_f = df_cost[df_cost["Project ID"].isin(active_pids)].copy()
+_capex_col = next((c for c in df_gen.columns if c.strip().upper() == "CAPEX"), None)
 
-# Optional: respect "Include?" flag
-with st.sidebar:
-    st.markdown("---")
-    st.subheader("Cost chart options")
-    only_included = st.checkbox('Only rows where Include? = "Y"', value=True)
-    cost_phase_opts = df_cost["Cost Phase"].dropna().unique().tolist()
-    selected_phases = st.multiselect("Cost phases", options=cost_phase_opts, default=cost_phase_opts)
-
-if only_included and "Include?" in df_cost_f.columns:
-    df_cost_f = df_cost_f[df_cost_f["Include?"] == "Y"]
-
-df_cost_f = df_cost_f[df_cost_f["Cost Phase"].isin(selected_phases)]
-
-if df_cost_f.empty:
-    st.info("No cost data for the selected projects / filters.")
-    st.stop()
-
-# ── 2a  CAPEX / comparable rows → USD/MWp stacked bar ────────────────────────
-df_capex = df_cost_f[df_cost_f["USD_per_MWp"].notna()].copy()
-df_opex  = df_cost_f[df_cost_f["USD_per_year"].notna()].copy()
-
-c1, c2 = st.columns([3, 1])
-with c2:
-    chart2_mode = st.radio("Group by", ["Cost Group", "Component"], index=1)
-    show_pct = st.checkbox("Show as % of total", value=False)
-
-if not df_capex.empty:
-    st.subheader("CAPEX / Capital-equivalent — USD / MWp (DC)")
-
-    pivot = (
-        df_capex.groupby(["Project ID", chart2_mode])["USD_per_MWp"]
-        .sum()
-        .reset_index()
-    )
-
-    if show_pct:
-        totals = pivot.groupby("Project ID")["USD_per_MWp"].transform("sum")
-        pivot["USD_per_MWp"] = 100 * pivot["USD_per_MWp"] / totals
-        y_label = "Share (%)"
-    else:
-        y_label = "USD / MWp (DC)"
-
-    fig2 = px.bar(
-        pivot,
-        x="Project ID",
-        y="USD_per_MWp",
-        color=chart2_mode,
-        barmode="stack",
-        text_auto=".3s",
-        labels={"USD_per_MWp": y_label},
-        color_discrete_sequence=COLOUR_SEQ,
-        height=460,
-    )
-    fig2.update_traces(textposition="inside", textfont_size=11)
-    fig2.update_layout(
-        yaxis_title=y_label,
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-    )
-    st.plotly_chart(fig2, use_container_width=True)
+if _capex_col is None:
+    st.info('No "CAPEX" column found in the General sheet.')
 else:
-    st.info("No CAPEX / comparable cost data in the current selection.")
+    df_cap = df_f[[label_col, _capex_col] + ([_curr_col] if _curr_col else [])].copy()
+    df_cap["_capex_native"] = pd.to_numeric(df_cap[_capex_col], errors="coerce")
+    df_cap["_fx"] = df_cap[_curr_col].apply(get_fx) if _curr_col else 1.0
+    # CAPEX column is in m$ native → convert to m$ USD
+    df_cap["_capex_usd"] = df_cap["_capex_native"] * df_cap["_fx"]
+    df_cap = df_cap[df_cap["_capex_usd"].notna() & (df_cap["_capex_usd"] > 0)] \
+               .sort_values("_capex_usd", ascending=False)
 
-# ── 2b  OPEX → USD/year bar ───────────────────────────────────────────────────
-if not df_opex.empty:
-    st.subheader("OPEX — USD / year")
+    if df_cap.empty:
+        st.info("No CAPEX data for the selected projects.")
+    else:
+        fig2 = px.bar(
+            df_cap,
+            x=label_col,
+            y="_capex_usd",
+            text_auto=".3s",
+            color="_capex_usd",
+            color_continuous_scale="RdYlBu_r",
+            labels={"_capex_usd": "CAPEX (m$ USD)", label_col: "Project"},
+            height=440,
+        )
+        fig2.update_traces(textposition="outside", textfont_size=10)
+        fig2.update_layout(
+            yaxis_title="CAPEX (m$ USD)",
+            xaxis_tickangle=-35,
+            coloraxis_showscale=False,
+        )
+        st.plotly_chart(fig2, use_container_width=True)
 
-    pivot_opex = (
-        df_opex.groupby(["Project ID", chart2_mode])["USD_per_year"]
-        .sum()
-        .reset_index()
-    )
+# ══════════════════════════════════════════════════════════════════════════════
+# CHART 3 — OPEX by project (General sheet, FX-converted to USD/year)
+# ══════════════════════════════════════════════════════════════════════════════
+st.header("OPEX by Project ($/year)")
 
-    fig3 = px.bar(
-        pivot_opex,
-        x="Project ID",
-        y="USD_per_year",
-        color=chart2_mode,
-        barmode="stack",
-        text_auto=".3s",
-        labels={"USD_per_year": "USD / year"},
-        color_discrete_sequence=COLOUR_SEQ,
-        height=380,
-    )
-    fig3.update_traces(textposition="inside", textfont_size=11)
-    fig3.update_layout(
-        yaxis_title="USD / year",
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-    )
-    st.plotly_chart(fig3, use_container_width=True)
+_opex_col = next((c for c in df_gen.columns if c.strip().upper() == "OPEX"), None)
 
-# Detail table
-with st.expander("Show cost detail table"):
-    show_cols = ["Project ID", "Cost Phase", "Cost Group", "Component",
-                 "USD Value", "Unit Basis", "USD_per_MWp", "USD_per_year",
-                 "Source", "Confidence", "Comments"]
-    show_cols = [c for c in show_cols if c in df_cost_f.columns]
-    st.dataframe(df_cost_f[show_cols].reset_index(drop=True), use_container_width=True)
+if _opex_col is None:
+    st.info('No "OPEX" column found in the General sheet.')
+else:
+    df_opx = df_f[[label_col, _opex_col] + ([_curr_col] if _curr_col else [])].copy()
+    df_opx["_opex_native"] = pd.to_numeric(df_opx[_opex_col], errors="coerce")
+    df_opx["_fx"] = df_opx[_curr_col].apply(get_fx) if _curr_col else 1.0
+    df_opx["_opex_usd"] = df_opx["_opex_native"] * df_opx["_fx"]
+    df_opx = df_opx[df_opx["_opex_usd"].notna() & (df_opx["_opex_usd"] > 0)] \
+               .sort_values("_opex_usd", ascending=False)
+
+    if df_opx.empty:
+        st.info("No OPEX data for the selected projects.")
+    else:
+        fig3 = px.bar(
+            df_opx,
+            x=label_col,
+            y="_opex_usd",
+            text_auto=".3s",
+            color="_opex_usd",
+            color_continuous_scale="RdYlBu_r",
+            labels={"_opex_usd": "OPEX (USD/year)", label_col: "Project"},
+            height=440,
+        )
+        fig3.update_traces(textposition="outside", textfont_size=10)
+        fig3.update_layout(
+            yaxis_title="OPEX (USD/year)",
+            xaxis_tickangle=-35,
+            coloraxis_showscale=False,
+        )
+        st.plotly_chart(fig3, use_container_width=True)
