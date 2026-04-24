@@ -30,39 +30,106 @@ except Exception as e:
     st.stop()
 
 # ── Sidebar: FX rates for non-USD currencies ──────────────────────────────────
-_curr_col = next((c for c in df_gen.columns if c.strip().lower() == "native currency"), None)
-_fx_col   = next((c for c in df_gen.columns if c.strip().lower() == "fx to usd"), None)
+_curr_col      = next((c for c in df_gen.columns  if c.strip().lower() == "native currency"), None)
+_fx_col        = next((c for c in df_gen.columns  if c.strip().lower() == "fx to usd"), None)
+_cost_curr_col = next((c for c in df_cost.columns if c.strip().lower() == "currency"), None)
+_cost_fx_col   = next((c for c in df_cost.columns if c.strip().lower() == "fx to usd"), None)
 
 fx_rates = {"USD": 1.0}   # currency → rate applied to convert native → USD
 
+_all_non_usd = set()
 if _curr_col:
-    non_usd = [c for c in df_gen[_curr_col].dropna().unique() if str(c).strip().upper() != "USD"]
-    if non_usd:
-        with st.sidebar:
-            st.markdown("---")
-            st.subheader("Currency conversion to USD")
-            for curr in sorted(non_usd):
-                curr_str = str(curr).strip().upper()
-                # Suggest rate from FX to USD column if present, else 1.0
-                if _fx_col:
-                    mask = df_gen[_curr_col].astype(str).str.strip().str.upper() == curr_str
-                    suggested = df_gen.loc[mask, _fx_col].apply(pd.to_numeric, errors="coerce").mean()
-                    default = float(suggested) if pd.notna(suggested) else 1.0
-                else:
-                    default = 1.0
-                fx_rates[curr_str] = st.number_input(
-                    f"{curr_str} → USD",
-                    min_value=0.0001,
-                    value=round(default, 6),
-                    format="%.6f",
-                    key=f"fx_{curr_str}",
-                )
+    _all_non_usd |= {str(c).strip().upper() for c in df_gen[_curr_col].dropna()
+                     if str(c).strip().upper() != "USD"}
+if _cost_curr_col:
+    _all_non_usd |= {str(c).strip().upper() for c in df_cost[_cost_curr_col].dropna()
+                     if str(c).strip().upper() != "USD"}
+
+if _all_non_usd:
+    with st.sidebar:
+        st.markdown("---")
+        st.subheader("Currency conversion to USD")
+        for curr_str in sorted(_all_non_usd):
+            default = 1.0
+            if _fx_col and _curr_col:
+                mask = df_gen[_curr_col].astype(str).str.strip().str.upper() == curr_str
+                _sug = df_gen.loc[mask, _fx_col].apply(pd.to_numeric, errors="coerce").mean()
+                if pd.notna(_sug):
+                    default = float(_sug)
+            if default == 1.0 and _cost_fx_col and _cost_curr_col:
+                mask = df_cost[_cost_curr_col].astype(str).str.strip().str.upper() == curr_str
+                _sug = df_cost.loc[mask, _cost_fx_col].apply(pd.to_numeric, errors="coerce").mean()
+                if pd.notna(_sug):
+                    default = float(_sug)
+            fx_rates[curr_str] = st.number_input(
+                f"{curr_str} → USD",
+                min_value=0.0001,
+                value=round(default, 6),
+                format="%.6f",
+                key=f"fx_{curr_str}",
+            )
 
 def get_fx(currency):
     """Return the USD conversion rate for a currency string."""
     if pd.isna(currency):
         return 1.0
     return fx_rates.get(str(currency).strip().upper(), 1.0)
+
+
+# ── Cost-sheet aggregation ─────────────────────────────────────────────────────
+
+_c_pid   = next((c for c in df_cost.columns if c.strip() == "Project ID"),    None)
+_c_phase = next((c for c in df_cost.columns if c.strip() == "Cost Phase"),    None)
+_c_grp   = next((c for c in df_cost.columns if c.strip() == "Cost Group"),    None) or \
+           next((c for c in df_cost.columns if c.strip() == "Component"),     None)
+_c_val   = next((c for c in df_cost.columns if c.strip() == "Native Value"),  None)
+_c_unit  = next((c for c in df_cost.columns if c.strip() == "Unit Basis"),    None)
+_c_dc    = next((c for c in df_cost.columns if c.strip() == "Project DC MWp"), None)
+_c_inc   = next((c for c in df_cost.columns if c.strip() == "Include?"),      None)
+
+
+def cost_totals(project_ids, phase_values, to_m_usd=True):
+    """
+    Aggregate Cost sheet rows for the given projects and Cost Phase values.
+    to_m_usd=True  → _value column in m$ USD  (for CAPEX chart)
+    to_m_usd=False → _value column in USD/year (for OPEX chart)
+    Returns DataFrame[Project ID, Cost Group, _value].
+    """
+    if _c_pid is None or _c_phase is None or not project_ids:
+        return pd.DataFrame(columns=["Project ID", "Cost Group", "_value"])
+
+    df = df_cost[df_cost[_c_pid].isin(project_ids)].copy()
+    df = df[df[_c_phase].isin(phase_values)]
+    if _c_inc:
+        df = df[df[_c_inc].astype(str).str.strip().str.upper() != "N"]
+
+    df["_native"] = pd.to_numeric(df[_c_val], errors="coerce") if _c_val else np.nan
+    df["_fx"]     = df[_cost_curr_col].apply(get_fx) if _cost_curr_col else 1.0
+    df["_dc_kwp"] = (pd.to_numeric(df[_c_dc], errors="coerce") * 1000
+                     if _c_dc else pd.Series(0.0, index=df.index))
+
+    units = df[_c_unit].astype(str).str.strip() if _c_unit else pd.Series("", index=df.index)
+    base  = df["_native"] * df["_fx"]
+
+    df["_usd"] = np.where(
+        units == "m$",    base * 1e6,
+        np.where(
+            units == "$/kWp", base * df["_dc_kwp"].where(df["_dc_kwp"] > 0),
+            base              # $/year or $
+        )
+    )
+
+    df["_value"] = df["_usd"] / 1e6 if to_m_usd else df["_usd"]
+
+    grp_col = _c_grp or "Component"
+    agg = (
+        df[df["_value"].notna() & (df["_value"] > 0)]
+        .groupby([_c_pid, grp_col], as_index=False)["_value"]
+        .sum()
+        .rename(columns={_c_pid: "Project ID", grp_col: "Cost Group"})
+    )
+    return agg
+
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def numeric_cols(df):
@@ -182,80 +249,190 @@ with st.expander("Show filtered data"):
 
 # Shared scope across Chart 2 and 3
 label_col = "Project Name" if "Project Name" in df_f.columns else "Project ID"
+_proj_ids = set(df_f["Project ID"].dropna()) if "Project ID" in df_f.columns else set()
+
+# ── General-sheet column lookups used by Charts 2 & 3 ────────────────────────
+_capex_col = next((c for c in df_gen.columns if c.strip().upper() == "CAPEX"), None)
+_opex_col  = next((c for c in df_gen.columns if c.strip().upper() == "OPEX"),  None)
+
+
+def _gen_totals(value_col):
+    """Return DataFrame[Project ID, label_col, _value] from the General sheet (m$ USD)."""
+    if value_col is None:
+        return pd.DataFrame(columns=["Project ID", label_col, "_value"])
+    cols = ["Project ID", label_col, value_col] + ([_curr_col] if _curr_col else [])
+    df = df_f[cols].copy()
+    df["_value"] = (pd.to_numeric(df[value_col], errors="coerce")
+                    * (df[_curr_col].apply(get_fx) if _curr_col else 1.0))
+    return df[df["_value"].notna() & (df["_value"] > 0)][["Project ID", label_col, "_value"]]
+
+
+def _build_chart_df(gen_df, cost_phase_values):
+    """
+    Combine General-sheet totals with Cost-sheet breakdown.
+    Projects that have Cost-sheet rows → stacked by Cost Group.
+    Projects without Cost-sheet rows → single bar labelled 'Total'.
+    """
+    detail = cost_totals(_proj_ids, cost_phase_values, to_m_usd=True)
+    detail = detail.merge(
+        df_f[["Project ID", label_col]].drop_duplicates(), on="Project ID", how="left"
+    )
+    projects_with_detail = set(detail["Project ID"])
+
+    fallback = gen_df[~gen_df["Project ID"].isin(projects_with_detail)].copy()
+    fallback["Cost Group"] = "Total"
+
+    combined = pd.concat(
+        [detail[["Project ID", label_col, "Cost Group", "_value"]],
+         fallback[["Project ID", label_col, "_value"]].assign(**{"Cost Group": fallback["Cost Group"]})],
+        ignore_index=True,
+    )
+    return combined
+
 
 # ══════════════════════════════════════════════════════════════════════════════
-# CHART 2 — CAPEX by project (General sheet, FX-converted to USD)
+# CHART 2 — CAPEX by project
 # ══════════════════════════════════════════════════════════════════════════════
 st.header("CAPEX by Project")
-
-_capex_col = next((c for c in df_gen.columns if c.strip().upper() == "CAPEX"), None)
 
 if _capex_col is None:
     st.info('No "CAPEX" column found in the General sheet.')
 else:
-    df_cap = df_f[[label_col, _capex_col] + ([_curr_col] if _curr_col else [])].copy()
-    df_cap["_capex_native"] = pd.to_numeric(df_cap[_capex_col], errors="coerce")
-    df_cap["_fx"] = df_cap[_curr_col].apply(get_fx) if _curr_col else 1.0
-    # CAPEX column is in m$ native → convert to m$ USD
-    df_cap["_capex_usd"] = df_cap["_capex_native"] * df_cap["_fx"]
-    df_cap = df_cap[df_cap["_capex_usd"].notna() & (df_cap["_capex_usd"] > 0)] \
-               .sort_values("_capex_usd", ascending=False)
-
-    if df_cap.empty:
+    df_cap2 = _build_chart_df(_gen_totals(_capex_col), ["CAPEX", "Hybrid Add-on"])
+    if df_cap2.empty:
         st.info("No CAPEX data for the selected projects.")
     else:
-        fig2 = px.bar(
-            df_cap,
-            x=label_col,
-            y="_capex_usd",
-            text_auto=".3s",
-            color="_capex_usd",
-            color_continuous_scale="RdYlBu_r",
-            labels={"_capex_usd": "CAPEX (m$ USD)", label_col: "Project"},
-            height=440,
+        proj_order_cap = (
+            df_cap2.groupby(label_col)["_value"].sum()
+            .sort_values(ascending=False).index.tolist()
         )
-        fig2.update_traces(textposition="outside", textfont_size=10)
+        fig2 = px.bar(
+            df_cap2,
+            x=label_col, y="_value", color="Cost Group",
+            barmode="stack",
+            category_orders={label_col: proj_order_cap},
+            labels={"_value": "CAPEX (m$ USD)", label_col: "Project"},
+            color_discrete_sequence=COLOUR_SEQ,
+            height=480,
+        )
         fig2.update_layout(
-            yaxis_title="CAPEX (m$ USD)",
-            xaxis_tickangle=-35,
-            coloraxis_showscale=False,
+            yaxis_title="CAPEX (m$ USD)", xaxis_tickangle=-35, legend_title="Cost Group"
         )
         st.plotly_chart(fig2, use_container_width=True)
 
 # ══════════════════════════════════════════════════════════════════════════════
-# CHART 3 — OPEX by project (General sheet, FX-converted to USD/year)
+# CHART 3 — OPEX by project
 # ══════════════════════════════════════════════════════════════════════════════
-st.header("OPEX by Project ($/year)")
-
-_opex_col = next((c for c in df_gen.columns if c.strip().upper() == "OPEX"), None)
+st.header("OPEX by Project (m$/year)")
 
 if _opex_col is None:
     st.info('No "OPEX" column found in the General sheet.')
 else:
-    df_opx = df_f[[label_col, _opex_col] + ([_curr_col] if _curr_col else [])].copy()
-    df_opx["_opex_native"] = pd.to_numeric(df_opx[_opex_col], errors="coerce")
-    df_opx["_fx"] = df_opx[_curr_col].apply(get_fx) if _curr_col else 1.0
-    df_opx["_opex_usd"] = df_opx["_opex_native"] * df_opx["_fx"]
-    df_opx = df_opx[df_opx["_opex_usd"].notna() & (df_opx["_opex_usd"] > 0)] \
-               .sort_values("_opex_usd", ascending=False)
-
-    if df_opx.empty:
+    df_opx2 = _build_chart_df(_gen_totals(_opex_col), ["OPEX"])
+    if df_opx2.empty:
         st.info("No OPEX data for the selected projects.")
     else:
-        fig3 = px.bar(
-            df_opx,
-            x=label_col,
-            y="_opex_usd",
-            text_auto=".3s",
-            color="_opex_usd",
-            color_continuous_scale="RdYlBu_r",
-            labels={"_opex_usd": "OPEX (USD/year)", label_col: "Project"},
-            height=440,
+        proj_order_opx = (
+            df_opx2.groupby(label_col)["_value"].sum()
+            .sort_values(ascending=False).index.tolist()
         )
-        fig3.update_traces(textposition="outside", textfont_size=10)
+        fig3 = px.bar(
+            df_opx2,
+            x=label_col, y="_value", color="Cost Group",
+            barmode="stack",
+            category_orders={label_col: proj_order_opx},
+            labels={"_value": "OPEX (m$/year)", label_col: "Project"},
+            color_discrete_sequence=COLOUR_SEQ,
+            height=480,
+        )
         fig3.update_layout(
-            yaxis_title="OPEX (USD/year)",
-            xaxis_tickangle=-35,
-            coloraxis_showscale=False,
+            yaxis_title="OPEX (m$/year)", xaxis_tickangle=-35, legend_title="Cost Group"
         )
         st.plotly_chart(fig3, use_container_width=True)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SUMMARY TABLE — per-project component costs in USD
+# ══════════════════════════════════════════════════════════════════════════════
+st.header("Project Cost Summary")
+
+
+def build_cost_summary():
+    if not _proj_ids:
+        return pd.DataFrame()
+
+    # -- Per-component USD breakdown from Cost sheet --
+    df = df_cost[df_cost[_c_pid].isin(_proj_ids)].copy() if _c_pid else pd.DataFrame()
+    if not df.empty and _c_inc:
+        df = df[df[_c_inc].astype(str).str.strip().str.upper() != "N"]
+
+    if not df.empty and _c_val:
+        df["_native"] = pd.to_numeric(df[_c_val], errors="coerce")
+        df["_fx"]     = df[_cost_curr_col].apply(get_fx) if _cost_curr_col else 1.0
+        df["_dc_kwp"] = (pd.to_numeric(df[_c_dc], errors="coerce") * 1000
+                         if _c_dc else pd.Series(0.0, index=df.index))
+        units = df[_c_unit].astype(str).str.strip() if _c_unit else pd.Series("", index=df.index)
+        base  = df["_native"] * df["_fx"]
+        df["_usd"] = np.where(
+            units == "m$",    base * 1e6,
+            np.where(
+                units == "$/kWp", base * df["_dc_kwp"].where(df["_dc_kwp"] > 0),
+                base,
+            ),
+        )
+        comp_col = "Component" if "Component" in df.columns else (_c_grp or "Component")
+        df["_col"] = df[_c_phase].astype(str) + " | " + df[comp_col].astype(str)
+        pivot = (
+            df[df["_usd"].notna()]
+            .groupby([_c_pid, "_col"])["_usd"]
+            .sum()
+            .unstack(fill_value=np.nan)
+            .reset_index()
+            .rename(columns={_c_pid: "Project ID"})
+        )
+    else:
+        pivot = pd.DataFrame(columns=["Project ID"])
+
+    # -- Total CAPEX (USD): Cost sheet preferred, else General × 1e6 --
+    cap_detail = (
+        cost_totals(_proj_ids, ["CAPEX", "Hybrid Add-on"], to_m_usd=False)
+        .groupby("Project ID")["_value"].sum()
+    )
+    cap_gen = (
+        _gen_totals(_capex_col).set_index("Project ID")["_value"] * 1e6
+        if _capex_col else pd.Series(dtype=float)
+    )
+    total_cap = cap_detail.combine_first(cap_gen).rename("Total CAPEX (USD)")
+
+    # -- Total OPEX (USD/year): Cost sheet preferred, else General × 1e6 --
+    opx_detail = (
+        cost_totals(_proj_ids, ["OPEX"], to_m_usd=False)
+        .groupby("Project ID")["_value"].sum()
+    )
+    opx_gen = (
+        _gen_totals(_opex_col).set_index("Project ID")["_value"] * 1e6
+        if _opex_col else pd.Series(dtype=float)
+    )
+    total_opx = opx_detail.combine_first(opx_gen).rename("Total OPEX (USD/year)")
+
+    base_df = df_f[["Project ID", label_col]].drop_duplicates()
+    result = (
+        base_df
+        .merge(pivot if not pivot.empty else pd.DataFrame(columns=["Project ID"]),
+               on="Project ID", how="left")
+        .merge(total_cap.reset_index(), on="Project ID", how="left")
+        .merge(total_opx.reset_index(), on="Project ID", how="left")
+        .drop(columns=["Project ID"])
+        .set_index(label_col)
+    )
+    return result
+
+
+tbl = build_cost_summary()
+if tbl.empty:
+    st.info("No cost data available for the selected projects.")
+else:
+    num_cols = tbl.select_dtypes("number").columns
+    st.dataframe(
+        tbl.style.format({c: "{:,.0f}" for c in num_cols}, na_rep="—"),
+        use_container_width=True,
+    )
