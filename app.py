@@ -1,3 +1,4 @@
+import io
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -240,7 +241,7 @@ def build_trend_data(from_year):
 # TABS
 # ══════════════════════════════════════════════════════════════════════════════
 
-tab1, tab2 = st.tabs(["📊 Overview", "🔍 Explorer"])
+tab1, tab2, tab3 = st.tabs(["📊 Overview", "🔍 Explorer", "📥 Import"])
 
 # ──────────────────────────────────────────────────────────────────────────────
 # TAB 1 — KPIs + cost trend
@@ -402,6 +403,29 @@ with tab2:
 
     df_f["_completeness"] = (df_f.notna().sum(axis=1) / len(df_f.columns) * 100).round(0).astype(int)
 
+    # Unique display labels — computed now so df_plot inherits the column
+    _base_label = "Project Name" if "Project Name" in df_f.columns else "Project ID"
+    if "Project ID" in df_f.columns and _base_label == "Project Name":
+        _dup_mask = df_f["Project Name"].astype(str).duplicated(keep=False)
+        df_f["_proj_label"] = np.where(
+            _dup_mask,
+            df_f["Project Name"].astype(str) + " (" + df_f["Project ID"].astype(str) + ")",
+            df_f["Project Name"].astype(str),
+        )
+        label_col = "_proj_label"
+    else:
+        label_col = _base_label
+
+    # Warn about projects with no X-axis value (excluded before tag_filter is even built)
+    _no_x_rows = df_gen[df_gen[x_col].isna()]
+    if not _no_x_rows.empty:
+        _id_col_x = next((c for c in ["Project Name", "Project ID"] if c in _no_x_rows.columns), None)
+        _missing_x = _no_x_rows[_id_col_x].astype(str).tolist() if _id_col_x else _no_x_rows.index.astype(str).tolist()
+        st.warning(
+            f"**{len(_missing_x)} project(s) excluded — no value for '{x_col}':** "
+            + ", ".join(_missing_x)
+        )
+
     # Split: rows missing Y value are excluded from chart and listed separately
     _y_numeric = pd.to_numeric(df_f[y1_col], errors="coerce")
     _no_y_mask = _y_numeric.isna()
@@ -533,31 +557,20 @@ with tab2:
 
     with st.expander("Show filtered data"):
         st.dataframe(
-            df_f.drop(columns=["_x_pos", "_size", "_completeness", "_has_metric"], errors="ignore")
-                .reset_index(drop=True),
+            df_plot.drop(columns=["_x_pos", "_size", "_completeness", "_has_metric", "_proj_label"], errors="ignore")
+                   .reset_index(drop=True),
             use_container_width=True,
         )
 
     # ── Shared for Charts 2, 3, table ─────────────────────────────────────────
-    _base_label = "Project Name" if "Project Name" in df_f.columns else "Project ID"
-    if "Project ID" in df_f.columns and _base_label == "Project Name":
-        _dup_mask = df_f["Project Name"].astype(str).duplicated(keep=False)
-        df_f["_proj_label"] = np.where(
-            _dup_mask,
-            df_f["Project Name"].astype(str) + " (" + df_f["Project ID"].astype(str) + ")",
-            df_f["Project Name"].astype(str),
-        )
-        label_col = "_proj_label"
-    else:
-        label_col = _base_label
-    _proj_ids = set(df_f["Project ID"].dropna()) if "Project ID" in df_f.columns else set()
+    _proj_ids = set(df_plot["Project ID"].dropna()) if "Project ID" in df_plot.columns else set()
 
     def _gen_totals(value_col):
         """Return DataFrame[Project ID, label_col, _value] in m$ USD (General sheet)."""
         if value_col is None:
             return pd.DataFrame(columns=["Project ID", label_col, "_value"])
         cols = ["Project ID", label_col, value_col] + ([_curr_col] if _curr_col else [])
-        df = df_f[cols].copy()
+        df = df_plot[cols].copy()
         df["_value"] = (pd.to_numeric(df[value_col], errors="coerce")
                         * (df[_curr_col].apply(get_fx) if _curr_col else 1.0))
         return df[df["_value"].notna() & (df["_value"] > 0)][["Project ID", label_col, "_value"]]
@@ -571,7 +584,7 @@ with tab2:
         """
         detail = cost_totals(_proj_ids, cost_phase_values, to_m_usd=True)
         detail = detail.merge(
-            df_f[["Project ID", label_col]].drop_duplicates(), on="Project ID", how="left"
+            df_plot[["Project ID", label_col]].drop_duplicates(), on="Project ID", how="left"
         )
         projects_with_detail = set(detail["Project ID"])
 
@@ -585,7 +598,7 @@ with tab2:
                 continue
             gap = float(gen_val) - float(cost_by_proj.get(pid, 0))
             if gap > 1e-9:
-                lbl = df_f.loc[df_f["Project ID"] == pid, label_col]
+                lbl = df_plot.loc[df_plot["Project ID"] == pid, label_col]
                 other_rows.append({
                     "Project ID": pid,
                     label_col:    lbl.iloc[0] if len(lbl) else pid,
@@ -706,23 +719,10 @@ with tab2:
                       if _opex_col else pd.Series(dtype=float))
         total_opx  = opx_detail.combine_first(opx_gen).rename("Total OPEX (USD/year)")
 
-        base_df = df_f[["Project ID", label_col]].drop_duplicates()
+        base_df = df_plot[["Project ID", label_col]].drop_duplicates()
         return (
             base_df
             .merge(pivot if not pivot.empty else pd.DataFrame(columns=["Project ID"]),
                    on="Project ID", how="left")
             .merge(total_cap.reset_index(), on="Project ID", how="left")
-            .merge(total_opx.reset_index(), on="Project ID", how="left")
-            .drop(columns=["Project ID"])
-            .set_index(label_col)
-        )
-
-    tbl = build_cost_summary()
-    if tbl.empty:
-        st.info("No cost data available for the selected projects.")
-    else:
-        num_cols = tbl.select_dtypes("number").columns
-        st.dataframe(
-            tbl.style.format({c: "{:,.0f}" for c in num_cols}, na_rep="—"),
-            use_container_width=True,
-        )
+         
