@@ -48,10 +48,10 @@ fx_rates = {"USD": 1.0}   # currency → rate applied to convert native → USD
 _all_non_usd = set()
 if _curr_col:
     _all_non_usd |= {str(c).strip().upper() for c in df_gen[_curr_col].dropna()
-                     if str(c).strip().upper() != "USD"}
+                     if str(c).strip() and str(c).strip().upper() != "USD"}
 if _cost_curr_col:
     _all_non_usd |= {str(c).strip().upper() for c in df_cost[_cost_curr_col].dropna()
-                     if str(c).strip().upper() != "USD"}
+                     if str(c).strip() and str(c).strip().upper() != "USD"}
 
 if _all_non_usd:
     with st.sidebar:
@@ -84,6 +84,30 @@ def get_fx(currency):
     return fx_rates.get(str(currency).strip().upper(), 1.0)
 
 
+def _resolve_units(units_series):
+    """Return (eff_unit, eff_factor) Series for a unit-basis Series.
+
+    Known units (m$, $/year, $/kWp) pass through unchanged with factor 1.
+    Unknown units are looked up in unit_conversions (populated from sidebar).
+    Anything not found defaults to $/year with factor 1.
+    """
+    eff_unit = pd.array(
+        [unit_conversions[u]["target"] if u not in _KNOWN_UNITS and u in unit_conversions else u
+         for u in units_series],
+        dtype="object"
+    )
+    eff_unit = pd.Series(eff_unit, index=units_series.index, dtype="object")
+    eff_factor = pd.to_numeric(
+        pd.Series(
+            [unit_conversions[u]["factor"] if u not in _KNOWN_UNITS and u in unit_conversions else 1.0
+             for u in units_series],
+            index=units_series.index,
+        ),
+        errors="coerce",
+    ).fillna(1.0)
+    return eff_unit, eff_factor
+
+
 # ── Cost-sheet aggregation ─────────────────────────────────────────────────────
 
 _c_pid   = next((c for c in df_cost.columns if c.strip() == "Project ID"),    None)
@@ -94,6 +118,33 @@ _c_val   = next((c for c in df_cost.columns if c.strip() == "Native Value"),  No
 _c_unit  = next((c for c in df_cost.columns if c.strip() == "Unit Basis"),    None)
 _c_dc    = next((c for c in df_cost.columns if c.strip() == "Project DC MWp"), None)
 _c_inc   = next((c for c in df_cost.columns if c.strip() == "Include?"),      None)
+
+_KNOWN_UNITS  = {"m$", "$/year", "$/kWp"}
+unit_conversions = {}   # unknown unit → {"target": known_unit, "factor": float}
+_unknown_units = []
+if _c_unit:
+    _unknown_units = sorted({
+        str(u).strip() for u in df_cost[_c_unit].dropna()
+        if str(u).strip() and str(u).strip() not in _KNOWN_UNITS
+    })
+
+if _unknown_units:
+    with st.sidebar:
+        st.markdown("---")
+        st.subheader("Unit basis conversion")
+        st.caption(
+            "These unit values in the Cost sheet are not one of the three standard units "
+            "(m$, $/year, $/kWp). Specify the target unit and the factor to multiply the "
+            "native value by to reach that unit."
+        )
+        for _u in _unknown_units:
+            st.markdown(f"**`{_u}`**")
+            _uc1, _uc2 = st.columns(2)
+            _tgt = _uc1.selectbox("→ convert to", ["$/year", "m$", "$/kWp"],
+                                  key=f"unit_tgt_{_u}")
+            _fac = _uc2.number_input("× factor", value=1.0, min_value=0.0,
+                                     format="%.6f", key=f"unit_fac_{_u}")
+            unit_conversions[_u] = {"target": _tgt, "factor": _fac}
 
 
 def cost_totals(project_ids, phase_values, to_m_usd=True):
@@ -119,11 +170,14 @@ def cost_totals(project_ids, phase_values, to_m_usd=True):
     units = df[_c_unit].astype(str).str.strip() if _c_unit else pd.Series("", index=df.index)
     base  = df["_native"] * df["_fx"]
 
+    _eff_unit, _eff_factor = _resolve_units(units)
+    base_adj = base * _eff_factor
+
     df["_usd"] = np.where(
-        units == "m$",    base * 1e6,
+        _eff_unit == "m$",    base_adj * 1e6,
         np.where(
-            units == "$/kWp", base * df["_dc_kwp"].where(df["_dc_kwp"] > 0),
-            base              # $/year or $
+            _eff_unit == "$/kWp", base_adj * df["_dc_kwp"].where(df["_dc_kwp"] > 0),
+            base_adj              # $/year or $
         )
     )
 
@@ -190,11 +244,14 @@ def build_trend_data(from_year):
             units         = df[_c_unit].astype(str).str.strip() if _c_unit else pd.Series("", index=df.index)
             base          = df["_native"] * df["_fx"]
 
+            _eff_unit, _eff_factor = _resolve_units(units)
+            base_adj = base * _eff_factor
+
             df["_usd_mwp"] = np.where(
-                units == "m$",    (base * 1e6) / df["_dc_mwp"].where(df["_dc_mwp"] > 0),
+                _eff_unit == "m$",    (base_adj * 1e6) / df["_dc_mwp"].where(df["_dc_mwp"] > 0),
                 np.where(
-                    units == "$/kWp", base * 1000,
-                    base / df["_dc_mwp"].where(df["_dc_mwp"] > 0),
+                    _eff_unit == "$/kWp", base_adj * 1000,
+                    base_adj / df["_dc_mwp"].where(df["_dc_mwp"] > 0),
                 ),
             )
             df["Year"]   = df[_c_pid].map(yr_map)
@@ -578,8 +635,9 @@ with tab2:
     def _build_chart_df(gen_df, cost_phase_values):
         """
         Combine General-sheet totals with Cost-sheet breakdown.
-        - Projects with Cost rows → stacked by Cost Group.
-          Any gap vs the General total is added as 'Other Cost'.
+        - Projects with Cost rows → stacked by Cost Group + 'Other Cost' gap.
+        - Projects whose Cost total > General total → Cost data is inconsistent;
+          revert to General sheet single 'Total' bar and warn.
         - Projects without Cost rows → single 'Total' bar from General.
         """
         detail = cost_totals(_proj_ids, cost_phase_values, to_m_usd=True)
@@ -591,13 +649,19 @@ with tab2:
         gen_by_proj  = gen_df.groupby("Project ID")["_value"].sum()
         cost_by_proj = detail.groupby("Project ID")["_value"].sum()
 
-        other_rows = []
+        other_rows   = []
+        override_ids = set()   # Cost > General → revert to General total
+
         for pid in projects_with_detail:
-            gen_val  = gen_by_proj.get(pid)
+            gen_val = gen_by_proj.get(pid)
             if gen_val is None or pd.isna(gen_val):
                 continue
-            gap = float(gen_val) - float(cost_by_proj.get(pid, 0))
-            if gap > 1e-9:
+            gen_f    = float(gen_val)
+            cost_f   = float(cost_by_proj.get(pid, 0))
+            gap      = gen_f - cost_f
+            if cost_f > gen_f + 1e-9:
+                override_ids.add(pid)
+            elif gap > 1e-9:
                 lbl = df_plot.loc[df_plot["Project ID"] == pid, label_col]
                 other_rows.append({
                     "Project ID": pid,
@@ -606,10 +670,21 @@ with tab2:
                     "_value":     gap,
                 })
 
-        fallback = gen_df[~gen_df["Project ID"].isin(projects_with_detail)].copy()
+        if override_ids:
+            _names = (df_plot.loc[df_plot["Project ID"].isin(override_ids), label_col]
+                      .drop_duplicates().tolist())
+            st.warning(
+                f"**{len(override_ids)} project(s) — Cost sheet total exceeds General sheet "
+                f"total; reverting to General sheet value:** " + ", ".join(_names)
+            )
+
+        detail_clean = detail[~detail["Project ID"].isin(override_ids)]
+
+        fallback_ids = (set(gen_df["Project ID"]) - projects_with_detail) | override_ids
+        fallback = gen_df[gen_df["Project ID"].isin(fallback_ids)].copy()
         fallback["Cost Group"] = "Total"
 
-        parts = [detail[["Project ID", label_col, "Cost Group", "_value"]]]
+        parts = [detail_clean[["Project ID", label_col, "Cost Group", "_value"]]]
         if other_rows:
             parts.append(pd.DataFrame(other_rows))
         parts.append(
@@ -692,9 +767,11 @@ with tab2:
                              if _c_dc else pd.Series(0.0, index=df.index))
             units = df[_c_unit].astype(str).str.strip() if _c_unit else pd.Series("", index=df.index)
             base  = df["_native"] * df["_fx"]
+            _eff_unit, _eff_factor = _resolve_units(units)
+            base_adj = base * _eff_factor
             df["_usd"] = np.where(
-                units == "m$",    base * 1e6,
-                np.where(units == "$/kWp", base * df["_dc_kwp"].where(df["_dc_kwp"] > 0), base),
+                _eff_unit == "m$",    base_adj * 1e6,
+                np.where(_eff_unit == "$/kWp", base_adj * df["_dc_kwp"].where(df["_dc_kwp"] > 0), base_adj),
             )
             comp_col = "Component" if "Component" in df.columns else (_c_grp or "Component")
             df["_col"] = df[_c_phase].astype(str) + " | " + df[comp_col].astype(str)
