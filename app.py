@@ -725,4 +725,185 @@ with tab2:
             .merge(pivot if not pivot.empty else pd.DataFrame(columns=["Project ID"]),
                    on="Project ID", how="left")
             .merge(total_cap.reset_index(), on="Project ID", how="left")
-         
+            .merge(total_opx.reset_index(), on="Project ID", how="left")
+            .drop(columns=["Project ID"])
+            .set_index(label_col)
+        )
+
+    tbl = build_cost_summary()
+    if tbl.empty:
+        st.info("No cost data available for the selected projects.")
+    else:
+        num_cols = tbl.select_dtypes("number").columns
+        st.dataframe(
+            tbl.style.format({c: "{:,.0f}" for c in num_cols}, na_rep="—"),
+            use_container_width=True,
+        )
+
+# ──────────────────────────────────────────────────────────────────────────────
+# TAB 3 — Import
+# ──────────────────────────────────────────────────────────────────────────────
+with tab3:
+    st.header("Import New Data")
+    st.caption(
+        "Upload an Excel file with the same two-sheet structure (General + Cost). "
+        "Rows whose Project ID already exists in the database are skipped."
+    )
+
+    @st.cache_data
+    def load_import_file(f):
+        xl = pd.ExcelFile(f)
+        sheets = xl.sheet_names
+        dg = pd.read_excel(xl, sheet_name="General") if "General" in sheets else pd.DataFrame()
+        dc = pd.read_excel(xl, sheet_name="Cost")    if "Cost"    in sheets else pd.DataFrame()
+        return dg, dc
+
+    import_file = st.file_uploader(
+        "Upload import file (.xlsx)", type=["xlsx", "xls"], key="import_uploader"
+    )
+
+    if import_file is None:
+        st.info("No file uploaded yet.")
+    else:
+        try:
+            df_imp_gen, df_imp_cost = load_import_file(import_file)
+        except Exception as e:
+            st.error(f"Could not read import file: {e}")
+            st.stop()
+
+        if df_imp_gen.empty and df_imp_cost.empty:
+            st.error("Import file has no 'General' or 'Cost' sheet.")
+            st.stop()
+
+        # ── Identify new rows ─────────────────────────────────────────────────
+        pid_col_gen  = next((c for c in df_imp_gen.columns  if c.strip() == "Project ID"), None)
+        pid_col_cost = next((c for c in df_imp_cost.columns if c.strip() == "Project ID"), None)
+
+        existing_gen_pids  = set(df_gen["Project ID"].dropna().astype(str))  if "Project ID" in df_gen.columns  else set()
+        existing_cost_pids = set(df_cost[_c_pid].dropna().astype(str))       if _c_pid else set()
+
+        if pid_col_gen and not df_imp_gen.empty:
+            new_gen_mask = ~df_imp_gen[pid_col_gen].astype(str).isin(existing_gen_pids)
+            df_add_gen   = df_imp_gen[new_gen_mask].copy()
+            dup_gen_pids = df_imp_gen[pid_col_gen].astype(str)[~new_gen_mask].tolist()
+        else:
+            df_add_gen   = df_imp_gen.copy()
+            dup_gen_pids = []
+
+        new_pids = set(df_add_gen[pid_col_gen].astype(str)) if pid_col_gen and not df_add_gen.empty else set()
+
+        if pid_col_cost and not df_imp_cost.empty:
+            # Keep Cost rows only for projects being added (or not yet in Cost sheet)
+            cost_mask    = ~df_imp_cost[pid_col_cost].astype(str).isin(existing_cost_pids)
+            df_add_cost  = df_imp_cost[cost_mask & df_imp_cost[pid_col_cost].astype(str).isin(
+                new_pids | (set(df_imp_cost[pid_col_cost].astype(str)) - existing_cost_pids)
+            )].copy()
+        else:
+            df_add_cost = df_imp_cost.copy()
+
+        if dup_gen_pids:
+            st.warning(
+                f"**{len(dup_gen_pids)} Project ID(s) already in database — skipped:** "
+                + ", ".join(dup_gen_pids)
+            )
+
+        # ── KPIs ──────────────────────────────────────────────────────────────
+        n_new   = len(df_add_gen)
+        n_cost  = len(df_add_cost)
+
+        new_countries = []
+        if "Country" in df_add_gen.columns and "Country" in df_gen.columns:
+            new_countries = sorted(
+                set(df_add_gen["Country"].dropna().astype(str))
+                - set(df_gen["Country"].dropna().astype(str))
+            )
+
+        dc_col_imp = next((c for c in df_add_gen.columns
+                           if "dc capacity" in c.lower() and "mwp" in c.lower()), None)
+        new_dc_mwp = (pd.to_numeric(df_add_gen[dc_col_imp], errors="coerce").sum()
+                      if dc_col_imp else None)
+
+        capex_col_imp = next((c for c in df_add_gen.columns if c.strip().upper() == "CAPEX"), None)
+        curr_col_imp  = next((c for c in df_add_gen.columns if c.strip().lower() == "native currency"), None)
+        new_avg_capex = None
+        if capex_col_imp and dc_col_imp:
+            _cap = pd.to_numeric(df_add_gen[capex_col_imp], errors="coerce")
+            if curr_col_imp:
+                _cap = _cap * df_add_gen[curr_col_imp].apply(get_fx) * 1e6
+            _dc  = pd.to_numeric(df_add_gen[dc_col_imp], errors="coerce").replace(0, np.nan) * 1000
+            _v   = (_cap / _dc).dropna()
+            if not _v.empty:
+                new_avg_capex = _v.mean()
+
+        k1, k2, k3, k4, k5 = st.columns(5)
+        k1.metric("New projects",      n_new)
+        k2.metric("New cost entries",  n_cost)
+        k3.metric("New DC capacity",   f"{new_dc_mwp:,.0f} MWp" if new_dc_mwp else "—")
+        k4.metric("New countries",     len(new_countries) if new_countries else 0)
+        k5.metric("Avg CAPEX (new)",   f"{new_avg_capex:,.0f} $/kWp" if new_avg_capex else "—")
+
+        if new_countries:
+            st.caption("New countries: " + ", ".join(new_countries))
+
+        # ── Preview tables ────────────────────────────────────────────────────
+        st.subheader(f"General sheet — {n_new} new row(s)")
+        if df_add_gen.empty:
+            st.info("No new rows to add to the General sheet.")
+        else:
+            st.dataframe(df_add_gen.reset_index(drop=True), use_container_width=True)
+
+        st.subheader(f"Cost sheet — {n_cost} new row(s)")
+        if df_add_cost.empty:
+            st.info("No new rows to add to the Cost sheet.")
+        else:
+            st.dataframe(df_add_cost.reset_index(drop=True), use_container_width=True)
+
+        # ── Action buttons ────────────────────────────────────────────────────
+        if df_add_gen.empty and df_add_cost.empty:
+            st.info("Nothing new to import — all Project IDs already exist in the database.")
+        else:
+            merged_gen  = pd.concat([df_gen,  df_add_gen],  ignore_index=True)
+            merged_cost = pd.concat([df_cost, df_add_cost], ignore_index=True)
+
+            # Build merged xlsx in memory for download
+            _buf = io.BytesIO()
+            with pd.ExcelWriter(_buf, engine="openpyxl") as _writer:
+                merged_gen.to_excel(_writer,  sheet_name="General", index=False)
+                merged_cost.to_excel(_writer, sheet_name="Cost",    index=False)
+            _buf.seek(0)
+
+            btn_col1, btn_col2 = st.columns(2)
+
+            btn_col2.download_button(
+                label="⬇ Download merged database",
+                data=_buf,
+                file_name="Costdatabase_merged.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+
+            # Write to disk only available when using the bundled local file
+            _can_write = uploaded_file is None
+            if btn_col1.button(
+                "💾 Write to original database",
+                disabled=not _can_write,
+                help="Only available when using the bundled database (no file uploaded in the sidebar).",
+            ):
+                st.session_state["_confirm_write"] = True
+
+            if st.session_state.get("_confirm_write"):
+                st.warning(
+                    "This will **permanently overwrite** `Costdatabase v.3.1.xlsx`. "
+                    "Download a backup first if needed."
+                )
+                c_yes, c_no = st.columns(2)
+                if c_yes.button("✅ Confirm — write now"):
+                    with pd.ExcelWriter("Costdatabase v.3.1.xlsx", engine="openpyxl") as _w:
+                        merged_gen.to_excel(_w,  sheet_name="General", index=False)
+                        merged_cost.to_excel(_w, sheet_name="Cost",    index=False)
+                    st.session_state.pop("_confirm_write", None)
+                    st.cache_data.clear()
+                    st.success("Database updated. Reloading…")
+                    st.rerun()
+                if c_no.button("❌ Cancel"):
+                    st.session_state.pop("_confirm_write", None)
+                    st.rerun()
